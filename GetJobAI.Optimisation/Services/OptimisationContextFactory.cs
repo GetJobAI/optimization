@@ -1,5 +1,6 @@
 using System.Text.Json;
 using GetJobAI.Optimisation.Data;
+using GetJobAI.Optimisation.Data.Models;
 using GetJobAI.Optimisation.Messaging.Events.ResumeScored;
 using GetJobAI.Optimisation.OptimisationService.Contexts;
 using Microsoft.EntityFrameworkCore;
@@ -18,11 +19,6 @@ public class OptimisationContextFactory(OptimisationDbContext db)
         if (optimisation is null) return null;
 
         var resume = await db.Resumes
-            .Include(r => r.WorkExperiences)
-            .Include(r => r.Skills)
-            .Include(r => r.Publications)
-            .Include(r => r.Activities)
-            .Include(r => r.AdditionalSections)
             .FirstOrDefaultAsync(r => r.Id == optimisation.ResumeId, ct);
         if (resume is null) return null;
 
@@ -30,21 +26,21 @@ public class OptimisationContextFactory(OptimisationDbContext db)
             ? JsonSerializer.Deserialize<AtsBreakdown>(optimisation.AtsDetailsJson, JsonOptions) ?? new AtsBreakdown()
             : new AtsBreakdown();
 
-        return Build(optimisation, resume, breakdown);
+        return Build(optimisation, resume.Content, breakdown);
     }
 
     private static OptimisationContext Build(
         Entities.Optimisation optimisation,
-        Entities.Resume resume,
+        ResumeContent content,
         AtsBreakdown bd) => new()
     {
         OptimisationId = optimisation.Id,
         ResumeId = optimisation.ResumeId,
         JobTitle = optimisation.JobTitle,
         CompanyName = optimisation.CompanyName,
-        CandidateName = resume.CandidateName,
-        ExistingSummary = resume.ExistingSummary,
-        DetectedLanguage = resume.DetectedLanguage,
+        CandidateName = content.Contact?.Name,
+        ExistingSummary = content.Summary,
+        DetectedLanguage = null,
         OverallScore = optimisation.OverallScore,
         ScoreKeywordEarned = optimisation.ScoreKeywordEarned,
         ScoreKeywordMax = optimisation.ScoreKeywordMax,
@@ -80,50 +76,27 @@ public class OptimisationContextFactory(OptimisationDbContext db)
             HasHeadersFooters = bd.FormatAndParseability.ParsingFlags.HasHeadersFooters,
             HasNonStandardFonts = bd.FormatAndParseability.ParsingFlags.HasNonStandardFonts
         },
-        WorkExperiences = resume.WorkExperiences
-            .Select(we => new WorkExperienceContext
+        WorkExperiences = content.Experience
+            .Select(e => new WorkExperienceContext
             {
-                EntryId = we.Id,
-                JobTitle = we.JobTitle,
-                CompanyName = we.CompanyName,
-                StartDate = we.StartDate,
-                EndDate = we.EndDate,
-                Bullets = we.Bullets
+                EntryId = Guid.NewGuid(),
+                JobTitle = e.Title,
+                CompanyName = e.Company,
+                StartDate = ParseStartDate(e.Dates),
+                EndDate = ParseEndDate(e.Dates),
+                Bullets = e.Bullets
             }).ToList(),
-        Skills = resume.Skills
-            .Select(s => new SkillContext
+        Skills = content.Skills
+            .SelectMany(g => g.Items.Select(item => new SkillContext
             {
-                SkillName = s.SkillName,
-                SkillNameRaw = s.SkillNameRaw,
-                Proficiency = s.Proficiency,
-                Category = s.Category
-            }).ToList(),
-        Publications = resume.Publications
-            .Select(p => new PublicationContext
-            {
-                EntryId = p.Id,
-                Title = p.Title,
-                Publisher = p.Publisher,
-                PublicationDate = p.PublicationDate,
-                Description = p.Description
-            }).ToList(),
-        Activities = resume.Activities
-            .Select(a => new ActivityContext
-            {
-                EntryId = a.Id,
-                ActivityName = a.ActivityName,
-                Organization = a.Organization,
-                Role = a.Role,
-                Highlights = a.Highlights
-            }).ToList(),
-        AdditionalSections = resume.AdditionalSections
-            .Select(s => new AdditionalSectionContext
-            {
-                EntryId = s.Id,
-                SectionType = s.SectionType ?? string.Empty,
-                Title = s.Title ?? string.Empty,
-                ContentJson = s.ContentJson ?? string.Empty
-            }).ToList(),
+                SkillName = item,
+                SkillNameRaw = item,
+                Category = g.Category
+            }))
+            .ToList(),
+        Publications = [],
+        Activities = [],
+        AdditionalSections = BuildAdditionalSections(content),
         JobRequiredSkills = (bd.SkillAlignment.Details ?? [])
             .Select(d => new JobSkillContext
             {
@@ -133,4 +106,58 @@ public class OptimisationContextFactory(OptimisationDbContext db)
             }).ToList(),
         JobPreferredSkills = []
     };
+
+    private static string ParseStartDate(string? dates)
+    {
+        if (string.IsNullOrWhiteSpace(dates)) return string.Empty;
+        var parts = dates.Split([" - ", " – ", " to "], 2, StringSplitOptions.TrimEntries);
+        return parts[0];
+    }
+
+    private static string ParseEndDate(string? dates)
+    {
+        if (string.IsNullOrWhiteSpace(dates)) return string.Empty;
+        var parts = dates.Split([" - ", " – ", " to "], 2, StringSplitOptions.TrimEntries);
+        return parts.Length > 1 ? parts[1] : string.Empty;
+    }
+
+    private static List<AdditionalSectionContext> BuildAdditionalSections(ResumeContent content)
+    {
+        var sections = new List<AdditionalSectionContext>();
+
+        if (content.Certifications.Count > 0)
+        {
+            sections.Add(new AdditionalSectionContext
+            {
+                EntryId = Guid.NewGuid(),
+                SectionType = "certifications",
+                Title = "Certifications",
+                ContentJson = JsonSerializer.Serialize(content.Certifications)
+            });
+        }
+
+        if (content.Languages.Count > 0)
+        {
+            sections.Add(new AdditionalSectionContext
+            {
+                EntryId = Guid.NewGuid(),
+                SectionType = "languages",
+                Title = "Languages",
+                ContentJson = JsonSerializer.Serialize(content.Languages)
+            });
+        }
+
+        if (content.Projects.Count > 0)
+        {
+            sections.Add(new AdditionalSectionContext
+            {
+                EntryId = Guid.NewGuid(),
+                SectionType = "projects",
+                Title = "Projects",
+                ContentJson = JsonSerializer.Serialize(content.Projects)
+            });
+        }
+
+        return sections;
+    }
 }

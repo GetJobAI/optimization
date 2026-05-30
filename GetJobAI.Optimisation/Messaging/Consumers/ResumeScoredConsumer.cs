@@ -1,6 +1,7 @@
 using System.Text.Json;
 using GetJobAI.Optimisation.Contracts;
 using GetJobAI.Optimisation.Data;
+using GetJobAI.Optimisation.Data.Models;
 using GetJobAI.Optimisation.Messaging.Events;
 using GetJobAI.Optimisation.Messaging.Events.ResumeScored;
 using GetJobAI.Optimisation.OptimisationService.Contexts;
@@ -24,19 +25,14 @@ public class ResumeScoredConsumer(
         var breakdown = msg.Breakdown;
 
         var resume = await db.Resumes
-            .Include(r => r.WorkExperiences)
-            .Include(r => r.Skills)
-            .Include(r => r.Publications)
-            .Include(r => r.Activities)
-            .Include(r => r.AdditionalSections)
             .FirstOrDefaultAsync(r => r.Id == msg.ResumeId, context.CancellationToken);
 
         if (resume is null)
         {
             logger.LogWarning(
-                "Resume {ResumeId} not found in local snapshot — skipping optimisation for job {JobAnalysisId}",
+                "Resume {ResumeId} not found — skipping optimisation for job {JobAnalysisId}",
                 msg.ResumeId, msg.JobAnalysisId);
-            
+
             return;
         }
 
@@ -68,7 +64,7 @@ public class ResumeScoredConsumer(
 
         try
         {
-            var optimisationContext = BuildContext(optimisation, msg, resume);
+            var optimisationContext = BuildContext(optimisation, msg, resume.Content);
             var suggestions = await orchestrator.RunAsync(optimisationContext, context.CancellationToken);
 
             SaveSuggestions(optimisation.Id, suggestions);
@@ -160,7 +156,7 @@ public class ResumeScoredConsumer(
     private static OptimisationContext BuildContext(
         Entities.Optimisation optimisation,
         ResumeScoredEvent msg,
-        Entities.Resume resume)
+        ResumeContent content)
     {
         var bd = msg.Breakdown;
 
@@ -170,9 +166,9 @@ public class ResumeScoredConsumer(
             ResumeId = optimisation.ResumeId,
             JobTitle = msg.JobTitle,
             CompanyName = msg.CompanyName,
-            CandidateName = resume.CandidateName,
-            ExistingSummary = resume.ExistingSummary,
-            DetectedLanguage = resume.DetectedLanguage,
+            CandidateName = content.Contact?.Name,
+            ExistingSummary = content.Summary,
+            DetectedLanguage = null,
             OverallScore = optimisation.OverallScore,
             ScoreKeywordEarned = optimisation.ScoreKeywordEarned,
             ScoreKeywordMax = optimisation.ScoreKeywordMax,
@@ -215,59 +211,31 @@ public class ResumeScoredConsumer(
                 HasNonStandardFonts = bd.FormatAndParseability.ParsingFlags.HasNonStandardFonts
             },
 
-            WorkExperiences = resume.WorkExperiences
-                .Select(we => new WorkExperienceContext
+            WorkExperiences = content.Experience
+                .Select(e => new WorkExperienceContext
                 {
-                    EntryId = we.Id,
-                    JobTitle = we.JobTitle,
-                    CompanyName = we.CompanyName,
-                    StartDate = we.StartDate,
-                    EndDate = we.EndDate,
-                    Bullets = we.Bullets
+                    EntryId = Guid.NewGuid(),
+                    JobTitle = e.Title,
+                    CompanyName = e.Company,
+                    StartDate = ParseStartDate(e.Dates),
+                    EndDate = ParseEndDate(e.Dates),
+                    Bullets = e.Bullets
                 })
                 .ToList(),
 
-            Skills = resume.Skills
-                .Select(s => new SkillContext
+            Skills = content.Skills
+                .SelectMany(g => g.Items.Select(item => new SkillContext
                 {
-                    SkillName = s.SkillName,
-                    SkillNameRaw = s.SkillNameRaw,
-                    Proficiency = s.Proficiency,
-                    Category = s.Category
-                })
+                    SkillName = item,
+                    SkillNameRaw = item,
+                    Category = g.Category
+                }))
                 .ToList(),
 
-            Publications = resume.Publications
-                .Select(p => new PublicationContext
-                {
-                    EntryId = p.Id,
-                    Title = p.Title,
-                    Publisher = p.Publisher,
-                    PublicationDate = p.PublicationDate,
-                    Description = p.Description
-                })
-                .ToList(),
+            Publications = [],
+            Activities = [],
 
-            Activities = resume.Activities
-                .Select(a => new ActivityContext
-                {
-                    EntryId = a.Id,
-                    ActivityName = a.ActivityName,
-                    Organization = a.Organization,
-                    Role = a.Role,
-                    Highlights = a.Highlights
-                })
-                .ToList(),
-
-            AdditionalSections = resume.AdditionalSections
-                .Select(s => new AdditionalSectionContext
-                {
-                    EntryId = s.Id,
-                    SectionType = s.SectionType ?? string.Empty,
-                    Title = s.Title ?? string.Empty,
-                    ContentJson = s.ContentJson ?? string.Empty
-                })
-                .ToList(),
+            AdditionalSections = BuildAdditionalSections(content),
 
             JobRequiredSkills = (bd.SkillAlignment.Details ?? [])
                 .Select(d => new JobSkillContext
@@ -280,5 +248,59 @@ public class ResumeScoredConsumer(
 
             JobPreferredSkills = []
         };
+    }
+
+    private static string ParseStartDate(string? dates)
+    {
+        if (string.IsNullOrWhiteSpace(dates)) return string.Empty;
+        var parts = dates.Split([" - ", " – ", " to "], 2, StringSplitOptions.TrimEntries);
+        return parts[0];
+    }
+
+    private static string ParseEndDate(string? dates)
+    {
+        if (string.IsNullOrWhiteSpace(dates)) return string.Empty;
+        var parts = dates.Split([" - ", " – ", " to "], 2, StringSplitOptions.TrimEntries);
+        return parts.Length > 1 ? parts[1] : string.Empty;
+    }
+
+    private static List<AdditionalSectionContext> BuildAdditionalSections(ResumeContent content)
+    {
+        var sections = new List<AdditionalSectionContext>();
+
+        if (content.Certifications.Count > 0)
+        {
+            sections.Add(new AdditionalSectionContext
+            {
+                EntryId = Guid.NewGuid(),
+                SectionType = "certifications",
+                Title = "Certifications",
+                ContentJson = System.Text.Json.JsonSerializer.Serialize(content.Certifications)
+            });
+        }
+
+        if (content.Languages.Count > 0)
+        {
+            sections.Add(new AdditionalSectionContext
+            {
+                EntryId = Guid.NewGuid(),
+                SectionType = "languages",
+                Title = "Languages",
+                ContentJson = System.Text.Json.JsonSerializer.Serialize(content.Languages)
+            });
+        }
+
+        if (content.Projects.Count > 0)
+        {
+            sections.Add(new AdditionalSectionContext
+            {
+                EntryId = Guid.NewGuid(),
+                SectionType = "projects",
+                Title = "Projects",
+                ContentJson = System.Text.Json.JsonSerializer.Serialize(content.Projects)
+            });
+        }
+
+        return sections;
     }
 }

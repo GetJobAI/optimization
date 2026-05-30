@@ -1,4 +1,6 @@
+using System.Text.Json;
 using GetJobAI.Optimisation.Data.Entities;
+using GetJobAI.Optimisation.Data.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
@@ -6,9 +8,14 @@ namespace GetJobAI.Optimisation.Data.Configurations;
 
 public class ResumeConfiguration : IEntityTypeConfiguration<Resume>
 {
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
+    };
+
     public void Configure(EntityTypeBuilder<Resume> builder)
     {
-        builder.ToTable("resumes");
+        builder.ToTable("resumes", t => t.ExcludeFromMigrations());
 
         builder.HasKey(x => x.Id);
 
@@ -20,48 +27,16 @@ public class ResumeConfiguration : IEntityTypeConfiguration<Resume>
             .HasColumnName("user_id")
             .IsRequired();
 
-        builder.Property(x => x.CandidateName)
-            .HasColumnName("candidate_name")
-            .HasMaxLength(300);
-
-        builder.Property(x => x.ExistingSummary)
-            .HasColumnName("existing_summary")
-            .HasColumnType("text");
-
-        builder.Property(x => x.DetectedLanguage)
-            .HasColumnName("detected_language")
-            .HasMaxLength(10);
+        builder.Property(x => x.Content)
+            .HasColumnName("content")
+            .HasColumnType("jsonb")
+            .HasConversion(
+                v => JsonSerializer.Serialize(v, JsonOptions),
+                v => JsonSerializer.Deserialize<ResumeContent>(v, JsonOptions) ?? new ResumeContent()
+            );
 
         builder.Property(x => x.UpdatedAt)
             .HasColumnName("updated_at")
             .IsRequired();
-
-        builder.HasMany(x => x.WorkExperiences)
-            .WithOne(x => x.Resume)
-            .HasForeignKey(x => x.ResumeId)
-            .OnDelete(DeleteBehavior.Cascade);
-
-        builder.HasMany(x => x.Skills)
-            .WithOne(x => x.Resume)
-            .HasForeignKey(x => x.ResumeId)
-            .OnDelete(DeleteBehavior.Cascade);
-
-        builder.HasMany(x => x.Publications)
-            .WithOne(x => x.Resume)
-            .HasForeignKey(x => x.ResumeId)
-            .OnDelete(DeleteBehavior.Cascade);
-
-        builder.HasMany(x => x.Activities)
-            .WithOne(x => x.Resume)
-            .HasForeignKey(x => x.ResumeId)
-            .OnDelete(DeleteBehavior.Cascade);
-
-        builder.HasMany(x => x.AdditionalSections)
-            .WithOne(x => x.Resume)
-            .HasForeignKey(x => x.ResumeId)
-            .OnDelete(DeleteBehavior.Cascade);
-
-        builder.HasIndex(x => x.UserId)
-            .HasDatabaseName("ix_resumes_user_id");
     }
 }
