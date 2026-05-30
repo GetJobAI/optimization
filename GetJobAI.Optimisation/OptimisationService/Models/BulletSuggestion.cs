@@ -4,6 +4,9 @@ namespace GetJobAI.Optimisation.OptimisationService.Models;
 
 public class BulletSuggestion
 {
+    [JsonPropertyName("id")]
+    public Guid Id { get; set; }
+
     [JsonPropertyName("original")]
     public string Original { get; set; } = string.Empty;
 

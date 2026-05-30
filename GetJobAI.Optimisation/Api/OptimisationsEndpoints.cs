@@ -2,10 +2,11 @@ using GetJobAI.Optimisation.Api.Requests;
 using GetJobAI.Optimisation.Api.Responses;
 using GetJobAI.Optimisation.Contracts;
 using GetJobAI.Optimisation.Data;
+using GetJobAI.Optimisation.Data.Models;
 using GetJobAI.Optimisation.OptimisationService.Contexts;
+using GetJobAI.Optimisation.OptimisationService.Models;
 using GetJobAI.Optimisation.Services;
 using Microsoft.EntityFrameworkCore;
-using Entities = GetJobAI.Optimisation.Data.Entities;
 
 namespace GetJobAI.Optimisation.Api;
 
@@ -18,16 +19,12 @@ public static class OptimisationsEndpoints
         group.MapPost("/work-experiences/{suggestionId:guid}/review", ReviewWorkExperience)
             .WithTags("Work Experiences")
             .WithSummary("Review a work experience suggestion")
-            .WithDescription("Accept or reject an AI-generated work experience suggestion. " +
-                             "A rejection hint is stored and passed to the AI on the next rewrite.")
             .Produces(StatusCodes.Status204NoContent)
             .Produces(StatusCodes.Status404NotFound);
 
         group.MapPost("/work-experiences/{suggestionId:guid}/rewrite", RewriteWorkExperience)
             .WithTags("Work Experiences")
             .WithSummary("Rewrite a work experience suggestion")
-            .WithDescription("Triggers an AI rewrite of the work experience entry. Replaces all existing bullets with " +
-                             "the new output. An optional hint guides the AI.")
             .Produces<WorkExperienceRewriteResponse>()
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status502BadGateway);
@@ -35,22 +32,18 @@ public static class OptimisationsEndpoints
         group.MapPost("/bullets/{bulletId:guid}/review", ReviewBullet)
             .WithTags("Bullets")
             .WithSummary("Review a bullet point")
-            .WithDescription("Accept or reject an individual AI-rewritten bullet point within a work experience suggestion.")
             .Produces(StatusCodes.Status204NoContent)
             .Produces(StatusCodes.Status404NotFound);
 
         group.MapPost("/activities/{suggestionId:guid}/review", ReviewActivity)
             .WithTags("Activities")
             .WithSummary("Review an activity suggestion")
-            .WithDescription("Accept or reject an AI-generated activity suggestion. A rejection hint is stored " +
-                             "and passed to the AI on the next rewrite.")
             .Produces(StatusCodes.Status204NoContent)
             .Produces(StatusCodes.Status404NotFound);
 
         group.MapPost("/activities/{suggestionId:guid}/rewrite", RewriteActivity)
             .WithTags("Activities")
             .WithSummary("Rewrite an activity suggestion")
-            .WithDescription("Triggers an AI rewrite of the activity entry. An optional hint guides the AI.")
             .Produces<ActivityRewriteResponse>()
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status502BadGateway);
@@ -58,8 +51,6 @@ public static class OptimisationsEndpoints
         group.MapPost("/cover-letter/generate", GenerateCoverLetter)
             .WithTags("Cover Letter")
             .WithSummary("Generate a cover letter")
-            .WithDescription("Generates or regenerates a cover letter using Gemini AI. Uses the session's accepted summary, " +
-                             "skills, and top bullets automatically. If a cover letter already exists it is overwritten.")
             .Produces<CoverLetterResponse>()
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status502BadGateway);
@@ -67,7 +58,6 @@ public static class OptimisationsEndpoints
         group.MapGet("/cover-letter", GetCoverLetter)
             .WithTags("Cover Letter")
             .WithSummary("Get the cover letter")
-            .WithDescription("Returns the saved cover letter for the optimisation session.")
             .Produces<CoverLetterResponse>()
             .Produces(StatusCodes.Status404NotFound);
 
@@ -81,18 +71,19 @@ public static class OptimisationsEndpoints
         OptimisationDbContext db,
         CancellationToken ct)
     {
-        var suggestion = await db.WorkExperienceSuggestions
-            .FirstOrDefaultAsync(s => s.Id == suggestionId && s.OptimisationId == optimisationId, ct);
+        var optimization = await db.Optimizations
+            .FirstOrDefaultAsync(o => o.Id == optimisationId, ct);
+        if (optimization is null) return Results.NotFound();
 
-        if (suggestion is null)
-        {
-            return Results.NotFound();
-        }
+        var we = optimization.AiSuggestions.WorkExperiences
+            .FirstOrDefault(x => x.Id == suggestionId);
+        if (we is null) return Results.NotFound();
 
-        suggestion.Accepted = request.Accepted;
-        suggestion.RejectionHint = request.Accepted ? null : request.Hint;
+        we.Accepted = request.Accepted;
+        we.RejectionHint = request.Accepted ? null : request.Hint;
+
+        db.Entry(optimization).Property(o => o.AiSuggestions).IsModified = true;
         await db.SaveChangesAsync(ct);
-
         return Results.NoContent();
     }
 
@@ -102,56 +93,45 @@ public static class OptimisationsEndpoints
         RewriteRequest request,
         OptimisationDbContext db,
         IPromptRunner promptRunner,
-        OptimisationContextFactory contextFactory,
         CancellationToken ct)
     {
-        var suggestion = await db.WorkExperienceSuggestions
-            .Include(s => s.Bullets)
-            .FirstOrDefaultAsync(s => s.Id == suggestionId && s.OptimisationId == optimisationId, ct);
-        
-        if (suggestion is null) return Results.NotFound();
+        var optimization = await db.Optimizations
+            .FirstOrDefaultAsync(o => o.Id == optimisationId, ct);
+        if (optimization is null) return Results.NotFound();
 
-        var ctx = await contextFactory.CreateAsync(optimisationId, ct);
-        if (ctx is null) return Results.NotFound();
+        var we = optimization.AiSuggestions.WorkExperiences
+            .FirstOrDefault(x => x.Id == suggestionId);
+        if (we is null) return Results.NotFound();
 
-        var entry = ctx.WorkExperiences.FirstOrDefault(we => we.EntryId == suggestion.EntryId);
+        var ctx = OptimisationContextFactory.BuildContext(optimisationId, optimization.ResumeId, optimization.AiSuggestions);
+        var entry = ctx.WorkExperiences.FirstOrDefault(e => e.EntryId == we.EntryId);
         if (entry is null) return Results.NotFound();
 
         var result = await promptRunner.RewriteExperienceAsync(entry, ctx, ct, request.Hint);
         if (!result.Success)
             return Results.Problem("AI rewrite failed", statusCode: 502);
 
-        db.BulletSuggestions.RemoveRange(suggestion.Bullets);
+        foreach (var bullet in result.Content.Bullets)
+            bullet.Id = Guid.NewGuid();
 
-        var newBullets = result.Content.Bullets
-            .Select(b => Entities.OptimisationBulletSuggestion.Create(
-                suggestion.Id,
-                b.Original,
-                b.Rewritten,
-                b.KeywordsAdded,
-                b.XyzApplied))
-            .ToList();
+        we.Include = result.Content.Include;
+        we.Reason = result.Content.Reason;
+        we.Bullets = result.Content.Bullets;
+        we.Accepted = null;
+        we.RejectionHint = null;
+        we.RewriteCount = (we.RewriteCount ?? 0) + 1;
 
-        db.BulletSuggestions.AddRange(newBullets);
-
-        suggestion.Include = result.Content.Include;
-        suggestion.Reason = result.Content.Reason;
-        suggestion.Accepted = null;
-        suggestion.RejectionHint = null;
-        suggestion.RewriteCount++;
-
+        db.Entry(optimization).Property(o => o.AiSuggestions).IsModified = true;
         await db.SaveChangesAsync(ct);
 
-        var response = new WorkExperienceRewriteResponse(
-            suggestion.Id,
-            suggestion.EntryId,
-            suggestion.Include,
-            suggestion.Reason,
-            suggestion.RewriteCount,
-            newBullets.Select(b => new BulletSuggestionResponse(
-                b.Id, b.Original, b.Rewritten, b.KeywordsAdded, b.XyzApplied, b.Accepted)).ToList());
-
-        return Results.Ok(response);
+        return Results.Ok(new WorkExperienceRewriteResponse(
+            we.Id,
+            we.EntryId,
+            we.Include,
+            we.Reason,
+            we.RewriteCount ?? 0,
+            we.Bullets.Select(b => new BulletSuggestionResponse(
+                b.Id, b.Original, b.Rewritten, b.KeywordsAdded, b.XyzApplied, b.Accepted)).ToList()));
     }
 
     private static async Task<IResult> ReviewBullet(
@@ -161,18 +141,19 @@ public static class OptimisationsEndpoints
         OptimisationDbContext db,
         CancellationToken ct)
     {
-        var bullet = await db.BulletSuggestions
-            .Include(b => b.WorkExperienceSuggestion)
-            .FirstOrDefaultAsync(b => b.Id == bulletId && b.WorkExperienceSuggestion.OptimisationId == optimisationId, ct);
+        var optimization = await db.Optimizations
+            .FirstOrDefaultAsync(o => o.Id == optimisationId, ct);
+        if (optimization is null) return Results.NotFound();
 
-        if (bullet is null)
-        {
-            return Results.NotFound();
-        }
+        var bullet = optimization.AiSuggestions.WorkExperiences
+            .SelectMany(we => we.Bullets)
+            .FirstOrDefault(b => b.Id == bulletId);
+        if (bullet is null) return Results.NotFound();
 
         bullet.Accepted = request.Accepted;
-        await db.SaveChangesAsync(ct);
 
+        db.Entry(optimization).Property(o => o.AiSuggestions).IsModified = true;
+        await db.SaveChangesAsync(ct);
         return Results.NoContent();
     }
 
@@ -183,18 +164,19 @@ public static class OptimisationsEndpoints
         OptimisationDbContext db,
         CancellationToken ct)
     {
-        var suggestion = await db.ActivitySuggestions
-            .FirstOrDefaultAsync(s => s.Id == suggestionId && s.OptimisationId == optimisationId, ct);
+        var optimization = await db.Optimizations
+            .FirstOrDefaultAsync(o => o.Id == optimisationId, ct);
+        if (optimization is null) return Results.NotFound();
 
-        if (suggestion is null)
-        {
-            return Results.NotFound();
-        }
+        var activity = optimization.AiSuggestions.Activities
+            .FirstOrDefault(a => a.Id == suggestionId);
+        if (activity is null) return Results.NotFound();
 
-        suggestion.Accepted = request.Accepted;
-        suggestion.RejectionHint = request.Accepted ? null : request.Hint;
+        activity.Accepted = request.Accepted;
+        activity.RejectionHint = request.Accepted ? null : request.Hint;
+
+        db.Entry(optimization).Property(o => o.AiSuggestions).IsModified = true;
         await db.SaveChangesAsync(ct);
-
         return Results.NoContent();
     }
 
@@ -204,39 +186,41 @@ public static class OptimisationsEndpoints
         RewriteRequest request,
         OptimisationDbContext db,
         IPromptRunner promptRunner,
-        OptimisationContextFactory contextFactory,
         CancellationToken ct)
     {
-        var suggestion = await db.ActivitySuggestions
-            .FirstOrDefaultAsync(s => s.Id == suggestionId && s.OptimisationId == optimisationId, ct);
-        if (suggestion is null) return Results.NotFound();
+        var optimization = await db.Optimizations
+            .FirstOrDefaultAsync(o => o.Id == optimisationId, ct);
+        if (optimization is null) return Results.NotFound();
 
-        var ctx = await contextFactory.CreateAsync(optimisationId, ct);
-        if (ctx is null) return Results.NotFound();
-
-        var activity = ctx.Activities.FirstOrDefault(a => a.EntryId == suggestion.EntryId);
+        var activity = optimization.AiSuggestions.Activities
+            .FirstOrDefault(a => a.Id == suggestionId);
         if (activity is null) return Results.NotFound();
 
-        var result = await promptRunner.RewriteActivityAsync(activity, ctx, ct, request.Hint);
+        var ctx = OptimisationContextFactory.BuildContext(optimisationId, optimization.ResumeId, optimization.AiSuggestions);
+        var activityCtx = ctx.Activities.FirstOrDefault(a => a.EntryId == activity.EntryId);
+        if (activityCtx is null) return Results.NotFound();
+
+        var result = await promptRunner.RewriteActivityAsync(activityCtx, ctx, ct, request.Hint);
         if (!result.Success)
             return Results.Problem("AI rewrite failed", statusCode: 502);
 
-        suggestion.Include = result.Content.Include;
-        suggestion.Reason = result.Content.Reason;
-        suggestion.HighlightsRewritten = result.Content.HighlightsRewritten;
-        suggestion.Accepted = null;
-        suggestion.RejectionHint = null;
-        suggestion.RewriteCount++;
+        activity.Include = result.Content.Include;
+        activity.Reason = result.Content.Reason;
+        activity.HighlightsRewritten = result.Content.HighlightsRewritten;
+        activity.Accepted = null;
+        activity.RejectionHint = null;
+        activity.RewriteCount = (activity.RewriteCount ?? 0) + 1;
 
+        db.Entry(optimization).Property(o => o.AiSuggestions).IsModified = true;
         await db.SaveChangesAsync(ct);
 
         return Results.Ok(new ActivityRewriteResponse(
-            suggestion.Id,
-            suggestion.EntryId,
-            suggestion.Include,
-            suggestion.Reason,
-            suggestion.HighlightsRewritten,
-            suggestion.RewriteCount));
+            activity.Id,
+            activity.EntryId,
+            activity.Include,
+            activity.Reason,
+            activity.HighlightsRewritten,
+            activity.RewriteCount ?? 0));
     }
 
     private static async Task<IResult> GenerateCoverLetter(
@@ -244,71 +228,63 @@ public static class OptimisationsEndpoints
         GenerateCoverLetterRequest request,
         OptimisationDbContext db,
         IPromptRunner promptRunner,
-        OptimisationContextFactory contextFactory,
         CancellationToken ct)
     {
-        var ctx = await contextFactory.CreateAsync(optimisationId, ct);
-        if (ctx is null) return Results.NotFound();
+        var optimization = await db.Optimizations
+            .FirstOrDefaultAsync(o => o.Id == optimisationId, ct);
+        if (optimization is null) return Results.NotFound();
 
-        var summarySuggestion = await db.SummarySuggestions
-            .FirstOrDefaultAsync(s => s.OptimisationId == optimisationId, ct);
+        var doc = optimization.AiSuggestions;
 
-        var acceptedSummary = summarySuggestion?.Rewritten
-            ?? summarySuggestion?.Original
-            ?? ctx.ExistingSummary
+        var acceptedSummary = doc.Summary?.Rewritten
+            ?? doc.Summary?.Original
+            ?? doc.ExistingSummary
             ?? string.Empty;
 
         var topAchievements = request.TopAchievements?.Count > 0
             ? request.TopAchievements
-            : await db.WorkExperienceSuggestions
-                .Include(we => we.Bullets)
-                .Where(we => we.OptimisationId == optimisationId)
+            : doc.WorkExperiences
+                .Where(we => we.Include)
                 .SelectMany(we => we.Bullets.Select(b => b.Rewritten))
                 .Take(5)
-                .ToListAsync(ct);
-
-        var existing = await db.CoverLetters
-            .FirstOrDefaultAsync(cl => cl.OptimisationId == optimisationId, ct);
+                .ToList();
 
         var coverLetterCtx = new CoverLetterContext
         {
-            JobTitle = ctx.JobTitle,
-            CompanyName = ctx.CompanyName,
+            JobTitle = doc.JobTitle,
+            CompanyName = doc.CompanyName,
             CompanyDescription = request.CompanyDescription ?? string.Empty,
-            CandidateName = ctx.CandidateName,
+            CandidateName = doc.CandidateName,
             AcceptedSummary = acceptedSummary,
             TopAchievements = topAchievements,
-            AcceptedSkills = ctx.Skills.Select(s => s.SkillName).ToList(),
-            MissingKeywords = ctx.MissingKeywords,
-            Language = ctx.DetectedLanguage ?? "en-GB",
+            AcceptedSkills = doc.ResumeSkills,
+            MissingKeywords = doc.MissingKeywords,
+            Language = "en-GB",
             CustomNote = request.CustomNote,
-            RewriteCount = existing?.RewriteCount ?? 0
+            RewriteCount = doc.CoverLetter?.RewriteCount ?? 0
         };
 
         var result = await promptRunner.GenerateCoverLetterAsync(coverLetterCtx, ct);
-
         if (!result.Success)
-        {
             return Results.Problem("AI generation failed", statusCode: 502);
-        }
 
         var cl = result.Content;
 
-        if (existing is not null)
+        doc.CoverLetter = new StoredCoverLetter
         {
-            existing.Update(cl.CoverLetter, cl.WordCount, cl.SalutationUsed, cl.KeyPointsMade);
-            existing.RewriteCount++;
-        }
-        else
-        {
-            existing = Entities.OptimisationCoverLetter.Create(
-                optimisationId, cl.CoverLetter, cl.WordCount, cl.SalutationUsed, cl.KeyPointsMade);
-            db.CoverLetters.Add(existing);
-        }
+            CoverLetter = cl.CoverLetter,
+            WordCount = cl.WordCount,
+            SalutationUsed = cl.SalutationUsed,
+            KeyPointsMade = cl.KeyPointsMade,
+            Accepted = null,
+            RewriteCount = (doc.CoverLetter?.RewriteCount ?? 0) + 1,
+            GeneratedAt = DateTime.UtcNow
+        };
 
+        db.Entry(optimization).Property(o => o.AiSuggestions).IsModified = true;
         await db.SaveChangesAsync(ct);
 
-        return Results.Ok(ToResponse(existing));
+        return Results.Ok(ToCoverLetterResponse(doc.CoverLetter));
     }
 
     private static async Task<IResult> GetCoverLetter(
@@ -316,12 +292,15 @@ public static class OptimisationsEndpoints
         OptimisationDbContext db,
         CancellationToken ct)
     {
-        var existing = await db.CoverLetters
-            .FirstOrDefaultAsync(cl => cl.OptimisationId == optimisationId, ct);
+        var optimization = await db.Optimizations
+            .FirstOrDefaultAsync(o => o.Id == optimisationId, ct);
 
-        return existing is null ? Results.NotFound() : Results.Ok(ToResponse(existing));
+        if (optimization?.AiSuggestions.CoverLetter is null)
+            return Results.NotFound();
+
+        return Results.Ok(ToCoverLetterResponse(optimization.AiSuggestions.CoverLetter));
     }
 
-    private static CoverLetterResponse ToResponse(Entities.OptimisationCoverLetter cl) =>
+    private static CoverLetterResponse ToCoverLetterResponse(StoredCoverLetter cl) =>
         new(cl.CoverLetter, cl.WordCount, cl.SalutationUsed, cl.KeyPointsMade, cl.Accepted, cl.RewriteCount, cl.GeneratedAt);
 }

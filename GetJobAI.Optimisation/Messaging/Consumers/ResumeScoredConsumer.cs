@@ -1,14 +1,12 @@
-using System.Text.Json;
 using GetJobAI.Optimisation.Contracts;
 using GetJobAI.Optimisation.Data;
+using GetJobAI.Optimisation.Data.Entities;
 using GetJobAI.Optimisation.Data.Models;
 using GetJobAI.Optimisation.Messaging.Events;
 using GetJobAI.Optimisation.Messaging.Events.ResumeScored;
 using GetJobAI.Optimisation.OptimisationService.Contexts;
-using GetJobAI.Optimisation.OptimisationService.Models;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
-using Entities = GetJobAI.Optimisation.Data.Entities;
 
 namespace GetJobAI.Optimisation.Messaging.Consumers;
 
@@ -17,173 +15,174 @@ public class ResumeScoredConsumer(
     OptimisationDbContext db,
     ILogger<ResumeScoredConsumer> logger) : IConsumer<ResumeScoredEvent>
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-
     public async Task Consume(ConsumeContext<ResumeScoredEvent> context)
     {
         var msg = context.Message;
-        var breakdown = msg.Breakdown;
+        var bd = msg.Breakdown;
 
         var resume = await db.Resumes
             .FirstOrDefaultAsync(r => r.Id == msg.ResumeId, context.CancellationToken);
 
         if (resume is null)
         {
-            logger.LogWarning(
-                "Resume {ResumeId} not found — skipping optimisation for job {JobAnalysisId}",
-                msg.ResumeId, msg.JobAnalysisId);
-
+            logger.LogWarning("Resume {ResumeId} not found — skipping optimisation", msg.ResumeId);
             return;
         }
 
-        var optimisation = Entities.Optimisation.Create(
-            resumeId: msg.ResumeId,
-            jobAnalysisId: msg.JobAnalysisId,
-            jobTitle: msg.JobTitle,
-            companyName: msg.CompanyName,
-            overallScore: msg.Score,
-            scoreKeywordEarned: (short)breakdown.KeywordMatchRate.Earned,
-            scoreKeywordMax: (short)breakdown.KeywordMatchRate.Max,
-            scoreSkillEarned: (short)breakdown.SkillAlignment.Earned,
-            scoreSkillMax: (short)breakdown.SkillAlignment.Max,
-            scoreFormatEarned: (short)breakdown.FormatAndParseability.Earned,
-            scoreFormatMax: (short)breakdown.FormatAndParseability.Max,
-            scoreExperienceEarned: (short)breakdown.ExperienceRelevance.Earned,
-            scoreExperienceMax: (short)breakdown.ExperienceRelevance.Max,
-            atsDetailsJson: JsonSerializer.Serialize(breakdown, JsonOptions));
+        var atsScoreId = await db.AtsScores
+            .Where(s => s.ResumeId == msg.ResumeId && s.JobPostingId == msg.JobAnalysisId)
+            .Select(s => s.Id)
+            .FirstOrDefaultAsync(context.CancellationToken);
 
-        db.Optimisations.Add(optimisation);
+        if (atsScoreId == Guid.Empty)
+        {
+            logger.LogWarning(
+                "ATS score not found for resume {ResumeId} / job {JobId} — skipping optimisation",
+                msg.ResumeId, msg.JobAnalysisId);
+            return;
+        }
+
+        var optimization = Optimization.Create(msg.ResumeId, msg.JobAnalysisId, atsScoreId);
+
+        var doc = optimization.AiSuggestions;
+        doc.Status = "in_progress";
+        doc.JobTitle = msg.JobTitle;
+        doc.CompanyName = msg.CompanyName;
+        doc.OverallScore = msg.Score;
+        doc.ScoreKeywordEarned = (short)bd.KeywordMatchRate.Earned;
+        doc.ScoreKeywordMax = (short)bd.KeywordMatchRate.Max;
+        doc.ScoreSkillEarned = (short)bd.SkillAlignment.Earned;
+        doc.ScoreSkillMax = (short)bd.SkillAlignment.Max;
+        doc.ScoreFormatEarned = (short)bd.FormatAndParseability.Earned;
+        doc.ScoreFormatMax = (short)bd.FormatAndParseability.Max;
+        doc.ScoreExperienceEarned = (short)bd.ExperienceRelevance.Earned;
+        doc.ScoreExperienceMax = (short)bd.ExperienceRelevance.Max;
+        doc.MatchedKeywords = bd.KeywordMatchRate.Details?.Match ?? [];
+        doc.PartialKeywords = bd.KeywordMatchRate.Details?.Partial ?? [];
+        doc.MissingKeywords = bd.KeywordMatchRate.Details?.Missing ?? [];
+        doc.SkillAlignmentDetails = bd.SkillAlignment.Details ?? [];
+        doc.ExperienceGapDetails = bd.ExperienceRelevance.Details ?? [];
+        doc.ParsingFlags = bd.FormatAndParseability.ParsingFlags;
+        doc.CandidateName = resume.Content.Contact?.Name;
+        doc.ExistingSummary = resume.Content.Summary;
+        doc.ResumeSkills = resume.Content.Skills
+            .SelectMany(g => g.Items)
+            .ToList();
+        doc.JobRequiredSkills = (bd.SkillAlignment.Details ?? [])
+            .Select(d => new JobRequiredSkillSnapshot
+            {
+                SkillName = d.RequiredSkill,
+                ImportanceScore = d.VectorSimilarityScore
+            })
+            .ToList();
+
+        // Build resume experience snapshots with stable entry IDs.
+        doc.ResumeExperiences = resume.Content.Experience
+            .Select(e => new ResumeExperienceSnapshot
+            {
+                EntryId = Guid.NewGuid(),
+                JobTitle = e.Title,
+                CompanyName = e.Company,
+                StartDate = ParseStartDate(e.Dates),
+                EndDate = ParseEndDate(e.Dates),
+                Bullets = e.Bullets
+            })
+            .ToList();
+
+        db.Optimizations.Add(optimization);
         await db.SaveChangesAsync(context.CancellationToken);
 
         logger.LogInformation(
-            "Optimisation {OptimisationId} started — resume {ResumeId}, job {JobAnalysisId}, score {Score}",
-            optimisation.Id, msg.ResumeId, msg.JobAnalysisId, msg.Score);
-
-        optimisation.Start();
-        await db.SaveChangesAsync(context.CancellationToken);
+            "Optimization {OptimizationId} created — resume {ResumeId}, job {JobId}, score {Score}",
+            optimization.Id, msg.ResumeId, msg.JobAnalysisId, msg.Score);
 
         try
         {
-            var optimisationContext = BuildContext(optimisation, msg, resume.Content);
+            var optimisationContext = BuildContext(optimization, doc, resume.UserId);
             var suggestions = await orchestrator.RunAsync(optimisationContext, context.CancellationToken);
 
-            SaveSuggestions(optimisation.Id, suggestions);
-            optimisation.Complete(suggestions.AtsExplanation, suggestions.SkillsGap);
+            // Assign stable IDs to every suggestion item.
+            foreach (var we in suggestions.WorkExperience)
+            {
+                we.Id = Guid.NewGuid();
+                foreach (var bullet in we.Bullets)
+                    bullet.Id = Guid.NewGuid();
+            }
+            foreach (var act in suggestions.Activities)
+                act.Id = Guid.NewGuid();
+            foreach (var pub in suggestions.Publications)
+                pub.Id = Guid.NewGuid();
+            foreach (var sec in suggestions.AdditionalSections)
+                sec.Id = Guid.NewGuid();
+
+            doc.Status = "completed";
+            doc.AtsExplanation = suggestions.AtsExplanation;
+            doc.SkillsGap = suggestions.SkillsGap;
+            doc.Summary = suggestions.Summary;
+            doc.WorkExperiences = suggestions.WorkExperience;
+            doc.Activities = suggestions.Activities;
+            doc.Publications = suggestions.Publications;
+            doc.AdditionalSections = suggestions.AdditionalSections;
+
+            db.Entry(optimization).Property(o => o.AiSuggestions).IsModified = true;
             await db.SaveChangesAsync(context.CancellationToken);
 
             await context.Publish(new ResumeOptimized
             {
-                OptimisationId = optimisation.Id,
-                ResumeId = optimisation.ResumeId,
-                OriginalAtsScore = optimisation.OverallScore,
+                OptimisationId = optimization.Id,
+                ResumeId = optimization.ResumeId,
+                UserId = Guid.TryParse(resume.UserId, out var uid) ? uid : Guid.Empty,
+                OriginalAtsScore = doc.OverallScore,
                 Status = "AwaitingReview"
             });
 
-            logger.LogInformation("Optimisation {OptimisationId} completed", optimisation.Id);
+            logger.LogInformation("Optimization {OptimizationId} completed", optimization.Id);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Optimisation {OptimisationId} failed", optimisation.Id);
+            logger.LogError(ex, "Optimization {OptimizationId} failed", optimization.Id);
 
-            optimisation.Fail(ex.Message);
+            doc.Status = "failed";
+            doc.ErrorMessage = ex.Message;
+            db.Entry(optimization).Property(o => o.AiSuggestions).IsModified = true;
             await db.SaveChangesAsync(context.CancellationToken);
 
             await context.Publish(new ResumeOptimized
             {
-                OptimisationId = optimisation.Id,
-                ResumeId = optimisation.ResumeId,
-                OriginalAtsScore = optimisation.OverallScore,
+                OptimisationId = optimization.Id,
+                ResumeId = optimization.ResumeId,
+                UserId = Guid.TryParse(resume.UserId, out var uid) ? uid : Guid.Empty,
+                OriginalAtsScore = doc.OverallScore,
                 Status = "Failed",
                 ErrorMessage = ex.Message
             });
         }
     }
 
-    private void SaveSuggestions(Guid optimisationId, AiSuggestionsDocument doc)
+    private static OptimisationContext BuildContext(Optimization optimization, OptimizationDoc doc, string userId)
     {
-        if (doc.Summary is not null)
-        {
-            db.SummarySuggestions.Add(Entities.OptimisationSummarySuggestion.Create(
-                optimisationId,
-                doc.Summary.Original,
-                doc.Summary.Rewritten,
-                doc.Summary.KeywordsIncorporated));
-        }
-
-        foreach (var we in doc.WorkExperience)
-        {
-            var weEntity = Entities.OptimisationWorkExperienceSuggestion.Create(
-                optimisationId, we.EntryId, we.Include, we.Reason);
-
-            foreach (var bullet in we.Bullets)
-                db.BulletSuggestions.Add(Entities.OptimisationBulletSuggestion.Create(
-                    weEntity.Id,
-                    bullet.Original,
-                    bullet.Rewritten,
-                    bullet.KeywordsAdded,
-                    bullet.XyzApplied));
-
-            db.WorkExperienceSuggestions.Add(weEntity);
-        }
-
-        foreach (var activity in doc.Activities)
-            db.ActivitySuggestions.Add(Entities.OptimisationActivitySuggestion.Create(
-                optimisationId,
-                activity.EntryId,
-                activity.Include,
-                activity.Reason,
-                activity.HighlightsRewritten));
-
-        foreach (var pub in doc.Publications)
-            db.SectionSuggestions.Add(Entities.OptimisationSectionSuggestion.Create(
-                optimisationId,
-                Entities.OptimisationSectionCategory.Publication,
-                pub.EntryId,
-                pub.SectionType,
-                pub.Include,
-                pub.Reason));
-
-        foreach (var section in doc.AdditionalSections)
-            db.SectionSuggestions.Add(Entities.OptimisationSectionSuggestion.Create(
-                optimisationId,
-                Entities.OptimisationSectionCategory.AdditionalSection,
-                section.EntryId,
-                section.SectionType,
-                section.Include,
-                section.Reason));
-    }
-
-    private static OptimisationContext BuildContext(
-        Entities.Optimisation optimisation,
-        ResumeScoredEvent msg,
-        ResumeContent content)
-    {
-        var bd = msg.Breakdown;
-
         return new OptimisationContext
         {
-            OptimisationId = optimisation.Id,
-            ResumeId = optimisation.ResumeId,
-            JobTitle = msg.JobTitle,
-            CompanyName = msg.CompanyName,
-            CandidateName = content.Contact?.Name,
-            ExistingSummary = content.Summary,
+            OptimisationId = optimization.Id,
+            ResumeId = optimization.ResumeId,
+            JobTitle = doc.JobTitle,
+            CompanyName = doc.CompanyName,
+            CandidateName = doc.CandidateName,
+            ExistingSummary = doc.ExistingSummary,
             DetectedLanguage = null,
-            OverallScore = optimisation.OverallScore,
-            ScoreKeywordEarned = optimisation.ScoreKeywordEarned,
-            ScoreKeywordMax = optimisation.ScoreKeywordMax,
-            ScoreSkillEarned = optimisation.ScoreSkillEarned,
-            ScoreSkillMax = optimisation.ScoreSkillMax,
-            ScoreFormatEarned = optimisation.ScoreFormatEarned,
-            ScoreFormatMax = optimisation.ScoreFormatMax,
-            ScoreExperienceEarned = optimisation.ScoreExperienceEarned,
-            ScoreExperienceMax = optimisation.ScoreExperienceMax,
-
-            MatchedKeywords = bd.KeywordMatchRate.Details?.Match ?? [],
-            PartialKeywords = bd.KeywordMatchRate.Details?.Partial ?? [],
-            MissingKeywords = bd.KeywordMatchRate.Details?.Missing ?? [],
-
-            SkillAlignmentDetails = (bd.SkillAlignment.Details ?? [])
+            OverallScore = doc.OverallScore,
+            ScoreKeywordEarned = doc.ScoreKeywordEarned,
+            ScoreKeywordMax = doc.ScoreKeywordMax,
+            ScoreSkillEarned = doc.ScoreSkillEarned,
+            ScoreSkillMax = doc.ScoreSkillMax,
+            ScoreFormatEarned = doc.ScoreFormatEarned,
+            ScoreFormatMax = doc.ScoreFormatMax,
+            ScoreExperienceEarned = doc.ScoreExperienceEarned,
+            ScoreExperienceMax = doc.ScoreExperienceMax,
+            MatchedKeywords = doc.MatchedKeywords,
+            PartialKeywords = doc.PartialKeywords,
+            MissingKeywords = doc.MissingKeywords,
+            SkillAlignmentDetails = doc.SkillAlignmentDetails
                 .Select(d => new SkillAlignmentContext
                 {
                     RequiredSkill = d.RequiredSkill,
@@ -192,8 +191,7 @@ public class ResumeScoredConsumer(
                     Flag = d.Flag
                 })
                 .ToList(),
-
-            ExperienceGapDetails = (bd.ExperienceRelevance.Details ?? [])
+            ExperienceGapDetails = doc.ExperienceGapDetails
                 .Select(d => new ExperienceGapContext
                 {
                     JobResponsibility = d.JobResponsibility,
@@ -202,50 +200,40 @@ public class ResumeScoredConsumer(
                     Flag = d.Flag
                 })
                 .ToList(),
-
-            ParsingFlags = new AtsParsingFlagsContext
-            {
-                HasComplexLayout = bd.FormatAndParseability.ParsingFlags.HasComplexLayout,
-                HasGraphics = bd.FormatAndParseability.ParsingFlags.HasGraphics,
-                HasHeadersFooters = bd.FormatAndParseability.ParsingFlags.HasHeadersFooters,
-                HasNonStandardFonts = bd.FormatAndParseability.ParsingFlags.HasNonStandardFonts
-            },
-
-            WorkExperiences = content.Experience
+            ParsingFlags = doc.ParsingFlags is { } pf
+                ? new AtsParsingFlagsContext
+                {
+                    HasComplexLayout = pf.HasComplexLayout,
+                    HasGraphics = pf.HasGraphics,
+                    HasHeadersFooters = pf.HasHeadersFooters,
+                    HasNonStandardFonts = pf.HasNonStandardFonts
+                }
+                : null,
+            WorkExperiences = doc.ResumeExperiences
                 .Select(e => new WorkExperienceContext
                 {
-                    EntryId = Guid.NewGuid(),
-                    JobTitle = e.Title,
-                    CompanyName = e.Company,
-                    StartDate = ParseStartDate(e.Dates),
-                    EndDate = ParseEndDate(e.Dates),
+                    EntryId = e.EntryId,
+                    JobTitle = e.JobTitle,
+                    CompanyName = e.CompanyName,
+                    StartDate = e.StartDate,
+                    EndDate = e.EndDate,
                     Bullets = e.Bullets
                 })
                 .ToList(),
-
-            Skills = content.Skills
-                .SelectMany(g => g.Items.Select(item => new SkillContext
-                {
-                    SkillName = item,
-                    SkillNameRaw = item,
-                    Category = g.Category
-                }))
+            Skills = doc.ResumeSkills
+                .Select(s => new SkillContext { SkillName = s, SkillNameRaw = s })
                 .ToList(),
-
             Publications = [],
             Activities = [],
-
-            AdditionalSections = BuildAdditionalSections(content),
-
-            JobRequiredSkills = (bd.SkillAlignment.Details ?? [])
-                .Select(d => new JobSkillContext
+            AdditionalSections = [],
+            JobRequiredSkills = doc.JobRequiredSkills
+                .Select(s => new JobSkillContext
                 {
-                    SkillName = d.RequiredSkill,
-                    ImportanceScore = d.VectorSimilarityScore,
+                    SkillName = s.SkillName,
+                    ImportanceScore = s.ImportanceScore,
                     IsRequired = true
                 })
                 .ToList(),
-
             JobPreferredSkills = []
         };
     }
@@ -262,45 +250,5 @@ public class ResumeScoredConsumer(
         if (string.IsNullOrWhiteSpace(dates)) return string.Empty;
         var parts = dates.Split([" - ", " – ", " to "], 2, StringSplitOptions.TrimEntries);
         return parts.Length > 1 ? parts[1] : string.Empty;
-    }
-
-    private static List<AdditionalSectionContext> BuildAdditionalSections(ResumeContent content)
-    {
-        var sections = new List<AdditionalSectionContext>();
-
-        if (content.Certifications.Count > 0)
-        {
-            sections.Add(new AdditionalSectionContext
-            {
-                EntryId = Guid.NewGuid(),
-                SectionType = "certifications",
-                Title = "Certifications",
-                ContentJson = System.Text.Json.JsonSerializer.Serialize(content.Certifications)
-            });
-        }
-
-        if (content.Languages.Count > 0)
-        {
-            sections.Add(new AdditionalSectionContext
-            {
-                EntryId = Guid.NewGuid(),
-                SectionType = "languages",
-                Title = "Languages",
-                ContentJson = System.Text.Json.JsonSerializer.Serialize(content.Languages)
-            });
-        }
-
-        if (content.Projects.Count > 0)
-        {
-            sections.Add(new AdditionalSectionContext
-            {
-                EntryId = Guid.NewGuid(),
-                SectionType = "projects",
-                Title = "Projects",
-                ContentJson = System.Text.Json.JsonSerializer.Serialize(content.Projects)
-            });
-        }
-
-        return sections;
     }
 }

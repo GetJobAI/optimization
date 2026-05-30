@@ -4,6 +4,9 @@ namespace GetJobAI.Optimisation.OptimisationService.Models;
 
 public class SectionRelevancySuggestion
 {
+    [JsonPropertyName("id")]
+    public Guid Id { get; set; }
+
     [JsonPropertyName("entry_id")]
     public Guid EntryId { get; set; }
 
